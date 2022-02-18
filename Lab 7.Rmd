@@ -13,12 +13,14 @@ library(here)
 library(broom)
 library(sf)
 library(tmap)
+library(gstat)
+library(stars)
 ```
 
-### Part 1: Spatial data wrangling, visualization
+# Part 1: Spatial data wrangling, visualization
 
 
-#### A. California county outlines (polygons)
+### A. California county outlines (polygons)
 
 ```{r}
 
@@ -35,7 +37,7 @@ ca_counties_df <- ca_counties_sf %>%
 
 ```
 
-#### Examine and set CRS
+### Examine and set CRS
 
 ```{r}
 
@@ -53,7 +55,7 @@ ggplot(data = ca_subset_sf) +
   labs(fill = "Land Area")
 ```
 
-#### B. Invasive red sesbania records (spatial points)
+### B. Invasive red sesbania records (spatial points)
 
 ```{r}
 
@@ -72,7 +74,7 @@ sesbania_3857_2_sf <- st_transform(sesbania_sf, st_crs(ca_subset_sf))
 sesbania_3857_sf %>%  st_crs()
 ```
 
-#### Plot then together!
+### Plot then together!
 
 ```{r}
 
@@ -81,7 +83,7 @@ ggplot() +
   geom_sf(data = sesbania_3857_sf, size = 1, color = 'red')
 ```
 
-#### Wrangle to fnd sesbania observations per county
+### Wrangle to fnd sesbania observations per county
 
 ```{r}
 
@@ -102,7 +104,7 @@ ggplot(data = ses_counts_sf) +
   labs(fill= 'Number of S. punicea records')
 ```
 
-#### Filter to just occurances in Solano County
+### Filter to just occurances in Solano County
 
 ```{r}
 
@@ -125,9 +127,136 @@ tmap_mode(mode = 'view')
 
 tm_shape(ca_subset_sf) +
   tm_fill('land_area', palette = 'BuGn') +
+  tm_borders(col = 'black') +
   tm_shape(sesbania_3857_sf) +
-  tm_dots()
+  tm_dots(col = 'red')
 ```
+
+# Part 2: Kriging
+
+```{r}
+
+# read in CA map and groundwater depth data
+ca_count_sf <- read_sf(here("data/ca_counties"),
+                       layer = 'CA_Counties_TIGER2016') %>% 
+  janitor::clean_names() %>% 
+  select(name)
+
+# check projectns
+st_crs(ca_count_sf)
+
+# read in gw data
+ca_dgw_sf <- read_sf(here("data", "ca_dgw",
+                          "F2013_DBGS_Points_20150720_093252.gpkg")) %>% 
+  janitor::clean_names()
+
+st_crs(ca_dgw_sf)
+
+ca_dgw_sf <- st_transform(ca_dgw_sf, st_crs(ca_count_sf))
+
+ggplot() +
+  geom_sf(data = ca_count_sf) +
+  geom_sf(data = ca_dgw_sf, aes(color = dgbs))
+```
+
+```{r}
+
+tmap_mode(mode = 'view')
+
+tm_shape(ca_dgw_sf) + 
+  tm_dots('dgbs', palette = 'Blues')
+
+# tmaptools::palette_explorer()  ## need 'shinyjs' package
+```
+
+### Clip to San Joaquin County
+
+```{r}
+
+sj_county_sf <- ca_count_sf %>% 
+  filter(name == 'San Joaquin')
+
+# now keep obs for groundwater depth in SJ County
+
+sj_depth_sf <- ca_dgw_sf %>% 
+  st_intersection(sj_county_sf)
+
+ggplot() +
+  geom_sf(data = sj_county_sf) +
+  geom_sf(data = sj_depth_sf, aes(color = dgbs)) +
+  theme_void() +
+  scale_color_viridis_c()
+```
+
+### Check for duplicate locations
+
+```{r}
+
+well_duplicates <- sj_depth_sf %>% 
+  janitor::get_dupes(latitude, longitude)
+
+sj_depth_sf <- sj_depth_sf %>% 
+  filter(!local_well %in% well_duplicates$local_well)
+```
+
+### Create a variogram!
+
+```{r}
+
+sj_dgw_vgm <- gstat::variogram(dgbs ~ 1, data = sj_depth_sf)
+# calculates a mean for sj county for ordinary kriging
+
+plot(sj_dgw_vgm)
+```
+
+```{r}
+
+# create variogram model
+
+sj_dgw_vgm_fit <- fit.variogram(sj_dgw_vgm,
+                               model = vgm(model = 'Gau',
+                                           nugget = 20,
+                                           sill = 3000,
+                                           range = 32000))
+
+plot(sj_dgw_vgm, sj_dgw_vgm_fit)
+
+attr(sj_dgw_vgm_fit, 'SSErr')
+```
+
+### Spatial Kriging
+
+```{r}
+
+sj_grid <- st_bbox(sj_county_sf) %>% 
+  st_as_stars(dx = 500, dy = 500) %>% 
+  st_set_crs(st_crs(sj_county_sf)) %>% 
+  st_crop(sj_county_sf)
+
+plot(sj_grid)
+
+# perform ordinary kriging
+
+sj_dgw_krige <- krige(dgbs ~ 1, sj_depth_sf, sj_grid,
+                      model = sj_dgw_vgm_fit)
+
+plot(sj_dgw_krige)
+
+krige_df <- as.data.frame(sj_dgw_krige) %>% 
+  st_as_sf(coords = c('x', 'y')) %>% 
+  drop_na(var1.pred)
+
+ggplot(data = krige_df) +
+  geom_sf(aes(color = var1.pred)) +
+  scale_color_gradient(low = 'purple', high = 'yellow') +
+  theme_void() +
+  labs(color = 'Predicted\nGroundwater\nDepth (m)')
+```
+
+
+
+
+
 
 
 
